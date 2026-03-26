@@ -92,6 +92,23 @@ This add-on supports various printer types:
 - Shared Windows printers (via Samba)
 - AirPrint for Apple devices
 
+## Network Discovery (macOS, Windows, iOS, Android)
+
+This add-on enables Bonjour/mDNS (DNS-SD) advertisement for shared CUPS printers, so clients on the same LAN can discover printers automatically.
+
+### Requirements
+
+- Home Assistant host and clients must be on the same Layer-2 network/VLAN, or your router must support mDNS reflection.
+- Printer queue must be marked as **Shared** in CUPS.
+- Add-on must have `host_network: true` (already configured).
+
+### Per platform
+
+- **macOS**: Printer appears automatically in **System Settings → Printers & Scanners**.
+- **iOS/iPadOS**: Printer appears automatically in AirPrint-capable apps.
+- **Android**: Printer appears through the system print service / Mopria-compatible discovery.
+- **Windows 10/11**: Discovery works on many setups with modern IPP support enabled; if not shown automatically, add manually using `http://<ha-ip>:631/printers/<queue-name>`.
+
 ## Troubleshooting
 
 ### Can't Access Web Interface

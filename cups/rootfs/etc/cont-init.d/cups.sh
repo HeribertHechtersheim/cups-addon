@@ -20,6 +20,11 @@ cat > /data/cups/config/cupsd.conf << EOL
 # Listen on all interfaces
 Listen 0.0.0.0:631
 
+# Enable DNS-SD/mDNS browsing and shared queues
+Browsing On
+BrowseLocalProtocols dnssd
+DefaultShared Yes
+
 # Allow access from local network
 <Location />
   Order allow,deny
@@ -69,6 +74,15 @@ ln -sf /data/cups/config/cupsd.conf /etc/cups/cupsd.conf
 ln -sf /data/cups/config/printers.conf /etc/cups/printers.conf
 ln -sf /data/cups/config/ppd /etc/cups/ppd
 ln -sf /data/cups/config/ssl /etc/cups/ssl
+
+# Start DBus and Avahi for mDNS/Bonjour discovery
+mkdir -p /run/dbus
+if [ ! -f /run/dbus/pid ]; then
+  dbus-daemon --system --fork
+fi
+
+mkdir -p /run/avahi-daemon
+avahi-daemon --daemonize --no-chroot
 
 # Start CUPS service
 /usr/sbin/cupsd -f
