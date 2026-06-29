@@ -20,12 +20,22 @@ touch /data/cups/config/printers.conf
 touch /data/cups/config/classes.conf
 touch /data/cups/config/subscriptions.conf
 touch /data/cups/config/lpoptions
+touch /data/cups/config/printers.conf.O
+touch /data/cups/config/classes.conf.O
+touch /data/cups/config/subscriptions.conf.O
+
+# Ensure CUPS can write all persisted files
+chown -R root:lp /data/cups/config
+chmod -R ug+rwX /data/cups/config
 
 # Create the server config once, then keep reusing the persistent copy
 if [ ! -f /data/cups/config/cupsd.conf ]; then
   cat > /data/cups/config/cupsd.conf << EOL
 # Listen on all interfaces
 Listen 0.0.0.0:631
+
+# Use persistent storage as CUPS server root
+ServerRoot /data/cups/config
 
 # Enable DNS-SD/mDNS browsing and shared queues
 Browsing On
@@ -80,6 +90,12 @@ fi
 # Create a symlink from the default config location to our persistent location
 ln -sf /data/cups/config/cupsd.conf /etc/cups/cupsd.conf
 ln -sf /data/cups/config/printers.conf /etc/cups/printers.conf
+ln -sf /data/cups/config/printers.conf.O /etc/cups/printers.conf.O
+ln -sf /data/cups/config/classes.conf /etc/cups/classes.conf
+ln -sf /data/cups/config/classes.conf.O /etc/cups/classes.conf.O
+ln -sf /data/cups/config/subscriptions.conf /etc/cups/subscriptions.conf
+ln -sf /data/cups/config/subscriptions.conf.O /etc/cups/subscriptions.conf.O
+ln -sf /data/cups/config/lpoptions /etc/cups/lpoptions
 ln -sf /data/cups/config/ppd /etc/cups/ppd
 ln -sf /data/cups/config/ssl /etc/cups/ssl
 
@@ -93,4 +109,4 @@ mkdir -p /run/avahi-daemon
 avahi-daemon --daemonize --no-chroot
 
 # Start CUPS service
-/usr/sbin/cupsd -f
+/usr/sbin/cupsd -f -c /data/cups/config/cupsd.conf
