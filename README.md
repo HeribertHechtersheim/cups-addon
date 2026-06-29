@@ -167,3 +167,10 @@ The following directories are maintained in the persistent storage:
 - `/data/cups/logs`: CUPS log files
 - `/data/cups/state`: CUPS state information
 
+Queue definitions and printer connection settings are stored under `/data/cups/config` via:
+- `printers.conf`: printer queues, device URIs, and server-side queue settings
+- `ppd/`: printer-specific PPD files and defaults
+- `classes.conf`: printer class definitions
+- `subscriptions.conf`: subscription and notification state
+- `lpoptions`: saved default print options
+

@@ -15,8 +15,15 @@ chmod -R 775 /data/cups
 # Create CUPS configuration directory if it doesn't exist
 mkdir -p /etc/cups
 
-# Basic CUPS configuration without admin authentication
-cat > /data/cups/config/cupsd.conf << EOL
+# Persist queue metadata files that CUPS updates when printers are added or edited
+touch /data/cups/config/printers.conf
+touch /data/cups/config/classes.conf
+touch /data/cups/config/subscriptions.conf
+touch /data/cups/config/lpoptions
+
+# Create the server config once, then keep reusing the persistent copy
+if [ ! -f /data/cups/config/cupsd.conf ]; then
+  cat > /data/cups/config/cupsd.conf << EOL
 # Listen on all interfaces
 Listen 0.0.0.0:631
 
@@ -68,6 +75,7 @@ DefaultAuthType None
 JobSheets none,none
 PreserveJobHistory No
 EOL
+fi
 
 # Create a symlink from the default config location to our persistent location
 ln -sf /data/cups/config/cupsd.conf /etc/cups/cupsd.conf
