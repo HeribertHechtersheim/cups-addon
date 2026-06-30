@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bash
+
+# Log every (re)start attempt so a crash-loop is visible in the add-on log,
+# distinct from cupsd's own error_log (which is tailed separately).
+now="$(date -Iseconds 2>/dev/null || date)"
+echo "[cups-service] ${now} starting cupsd -f -c /data/cups/config/cupsd.conf"
+
+exec /usr/sbin/cupsd -f -c /data/cups/config/cupsd.conf
