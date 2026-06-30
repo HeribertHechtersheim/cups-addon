@@ -9,6 +9,51 @@ BACKEND_DIR="/usr/lib/cups/backend"
 POWER_WRAPPED_BACKENDS="socket ipp ipps lpd usb dnssd"
 POWER_LOG_FILE="/data/cups/logs/power-wrapper.log"
 
+log_startup() {
+  local message="$1"
+  echo "[power-hook] ${message}"
+  echo "[power-hook] ${message}" >> "${POWER_LOG_FILE}" 2>/dev/null || true
+}
+
+read_option_bool() {
+  local key="$1"
+  local default_value="$2"
+  local value
+
+  value=$(sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p" /data/options.json 2>/dev/null | head -n1)
+  if [ -n "${value}" ]; then
+    echo "${value}"
+  else
+    echo "${default_value}"
+  fi
+}
+
+read_option_int() {
+  local key="$1"
+  local default_value="$2"
+  local value
+
+  value=$(sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p" /data/options.json 2>/dev/null | head -n1)
+  if [ -n "${value}" ]; then
+    echo "${value}"
+  else
+    echo "${default_value}"
+  fi
+}
+
+read_option_str() {
+  local key="$1"
+  local default_value="$2"
+  local value
+
+  value=$(sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" /data/options.json 2>/dev/null | head -n1)
+  if [ -n "${value}" ]; then
+    echo "${value}"
+  else
+    echo "${default_value}"
+  fi
+}
+
 install_power_wrapper() {
   local backend="$1"
   local target="${BACKEND_DIR}/${backend}"
@@ -35,6 +80,9 @@ log_msg() {
   now="\$(date -Iseconds 2>/dev/null || date)"
   mkdir -p "\$(dirname "\${POWER_LOG_FILE}")" >/dev/null 2>&1 || true
   echo "\${now} [power-hook-wrapper] \${message}" >> "\${POWER_LOG_FILE}" 2>/dev/null || true
+  if [ -w /proc/1/fd/1 ]; then
+    echo "\${now} [power-hook-wrapper] \${message}" > /proc/1/fd/1 2>/dev/null || true
+  fi
 }
 
 power_on_switch() {
@@ -144,26 +192,34 @@ POWER_SWITCH_ENTITY_ID=""
 POWER_ON_DELAY="0"
 
 if declare -F bashio::config >/dev/null 2>&1; then
+  log_startup "loading options via bashio"
   POWER_ON_BEFORE_PRINT="$(bashio::config 'power_on_before_print')"
   POWER_SWITCH_ENTITY_ID="$(bashio::config 'power_switch_entity_id')"
   POWER_ON_DELAY="$(bashio::config 'power_on_delay')"
+else
+  log_startup "bashio not found, loading options via /data/options.json"
+  POWER_ON_BEFORE_PRINT="$(read_option_bool 'power_on_before_print' 'false')"
+  POWER_SWITCH_ENTITY_ID="$(read_option_str 'power_switch_entity_id' '')"
+  POWER_ON_DELAY="$(read_option_int 'power_on_delay' '0')"
 fi
+
+log_startup "resolved config: enabled=${POWER_ON_BEFORE_PRINT} entity=${POWER_SWITCH_ENTITY_ID:-<empty>} delay=${POWER_ON_DELAY}s"
 
 if [ "${POWER_ON_BEFORE_PRINT}" = "true" ] && [ -n "${POWER_SWITCH_ENTITY_ID}" ]; then
   export HA_POWER_SWITCH_ENTITY_ID="${POWER_SWITCH_ENTITY_ID}"
   export HA_POWER_ON_DELAY="${POWER_ON_DELAY}"
 
-  echo "[power-hook] enabled: entity=${POWER_SWITCH_ENTITY_ID} delay=${POWER_ON_DELAY}s" >> "${POWER_LOG_FILE}"
+  log_startup "enabled: entity=${POWER_SWITCH_ENTITY_ID} delay=${POWER_ON_DELAY}s"
 
   for backend in ${POWER_WRAPPED_BACKENDS}; do
     install_power_wrapper "${backend}"
-    echo "[power-hook] wrapper installed for backend=${backend}" >> "${POWER_LOG_FILE}"
+    log_startup "wrapper installed for backend=${backend}"
   done
 else
-  echo "[power-hook] disabled: power_on_before_print=${POWER_ON_BEFORE_PRINT} entity=${POWER_SWITCH_ENTITY_ID:-<empty>}" >> "${POWER_LOG_FILE}"
+  log_startup "disabled: power_on_before_print=${POWER_ON_BEFORE_PRINT} entity=${POWER_SWITCH_ENTITY_ID:-<empty>}"
   for backend in ${POWER_WRAPPED_BACKENDS}; do
     restore_backend "${backend}"
-    echo "[power-hook] wrapper restored for backend=${backend}" >> "${POWER_LOG_FILE}"
+    log_startup "wrapper restored for backend=${backend}"
   done
 fi
 
