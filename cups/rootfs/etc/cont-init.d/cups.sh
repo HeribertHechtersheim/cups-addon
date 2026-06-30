@@ -7,6 +7,7 @@ fi
 
 BACKEND_DIR="/usr/lib/cups/backend"
 POWER_WRAPPED_BACKENDS="socket ipp ipps lpd usb dnssd"
+POWER_LOG_FILE="/data/cups/logs/power-wrapper.log"
 
 install_power_wrapper() {
   local backend="$1"
@@ -26,32 +27,53 @@ install_power_wrapper() {
 set -euo pipefail
 
 BACKEND_REAL="${real}"
+POWER_LOG_FILE="${POWER_LOG_FILE}"
+
+log_msg() {
+  local message="\${1:-}"
+  local now
+  now="\$(date -Iseconds 2>/dev/null || date)"
+  mkdir -p "\$(dirname "\${POWER_LOG_FILE}")" >/dev/null 2>&1 || true
+  echo "\${now} [power-hook-wrapper] \${message}" >> "\${POWER_LOG_FILE}" 2>/dev/null || true
+}
 
 power_on_switch() {
   local entity_id="\${HA_POWER_SWITCH_ENTITY_ID:-}"
   local delay="\${HA_POWER_ON_DELAY:-0}"
   local token="\${SUPERVISOR_TOKEN:-}"
+  local job_id="\${1:-unknown}"
+
+  log_msg "job=\${job_id} power_on_switch invoked entity=\${entity_id:-<empty>} delay=\${delay} token_present=\$([ -n "\${token}" ] && echo yes || echo no)"
 
   if [ -z "\${entity_id}" ] || [ -z "\${token}" ]; then
+    log_msg "job=\${job_id} skip power_on_switch due to missing entity_id or supervisor token"
     return 0
   fi
 
-  curl -sS --max-time 10 -X POST \
+  local http_code
+  http_code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 -X POST \
     -H "Authorization: Bearer \${token}" \
     -H "Content-Type: application/json" \
     -d "{\"entity_id\":\"\${entity_id}\"}" \
-    "http://supervisor/core/api/services/switch/turn_on" >/dev/null || true
+    "http://supervisor/core/api/services/switch/turn_on" || echo "curl_failed")
+
+  log_msg "job=\${job_id} switch.turn_on result=http_\${http_code}"
 
   if [[ "\${delay}" =~ ^[0-9]+$ ]] && [ "\${delay}" -gt 0 ]; then
+    log_msg "job=\${job_id} sleeping \${delay}s before forwarding job"
     sleep "\${delay}"
   fi
 }
 
 # Backends are called without job arguments for discovery.
 if [ "\$#" -ge 5 ]; then
-  power_on_switch
+  log_msg "backend_call mode=job args=\$# job_id=\${1:-unknown} user=\${2:-unknown} title=\${3:-unknown} copies=\${4:-unknown}"
+  power_on_switch "\${1:-unknown}"
+else
+  log_msg "backend_call mode=discovery args=\$#"
 fi
 
+log_msg "exec backend_real=\${BACKEND_REAL}"
 exec "\${BACKEND_REAL}" "\$@"
 EOF
 
@@ -69,6 +91,39 @@ restore_backend() {
   fi
 }
 
+ensure_admin_permissions() {
+  local cupsd_conf="/data/cups/config/cupsd.conf"
+
+  if [ ! -f "${cupsd_conf}" ]; then
+    return 0
+  fi
+
+  if grep -q "HA_CUPS_ADMIN_RIGHTS" "${cupsd_conf}"; then
+    return 0
+  fi
+
+  cat >> "${cupsd_conf}" << 'EOL'
+
+# HA_CUPS_ADMIN_RIGHTS
+# Allow LAN users to manage and cancel jobs from the web UI.
+<Limit Cancel-Job Cancel-My-Jobs Cancel-Current-Job Purge-Jobs CUPS-Move-Job>
+  Order allow,deny
+  Allow localhost
+  Allow 10.0.0.0/8
+  Allow 172.16.0.0/12
+  Allow 192.168.0.0/16
+</Limit>
+
+<Limit CUPS-Add-Modify-Printer CUPS-Delete-Printer CUPS-Add-Modify-Class CUPS-Delete-Class CUPS-Set-Default CUPS-Accept-Jobs CUPS-Reject-Jobs Pause-Printer Resume-Printer Enable-Printer Disable-Printer>
+  Order allow,deny
+  Allow localhost
+  Allow 10.0.0.0/8
+  Allow 172.16.0.0/12
+  Allow 192.168.0.0/16
+</Limit>
+EOL
+}
+
 # Create CUPS data directories for persistence
 mkdir -p /data/cups/cache
 mkdir -p /data/cups/logs
@@ -80,6 +135,9 @@ mkdir -p /data/cups/config/ssl
 # Set proper permissions
 chown -R root:lp /data/cups
 chmod -R 775 /data/cups
+touch "${POWER_LOG_FILE}"
+chown root:lp "${POWER_LOG_FILE}"
+chmod 664 "${POWER_LOG_FILE}"
 
 POWER_ON_BEFORE_PRINT="false"
 POWER_SWITCH_ENTITY_ID=""
@@ -95,12 +153,17 @@ if [ "${POWER_ON_BEFORE_PRINT}" = "true" ] && [ -n "${POWER_SWITCH_ENTITY_ID}" ]
   export HA_POWER_SWITCH_ENTITY_ID="${POWER_SWITCH_ENTITY_ID}"
   export HA_POWER_ON_DELAY="${POWER_ON_DELAY}"
 
+  echo "[power-hook] enabled: entity=${POWER_SWITCH_ENTITY_ID} delay=${POWER_ON_DELAY}s" >> "${POWER_LOG_FILE}"
+
   for backend in ${POWER_WRAPPED_BACKENDS}; do
     install_power_wrapper "${backend}"
+    echo "[power-hook] wrapper installed for backend=${backend}" >> "${POWER_LOG_FILE}"
   done
 else
+  echo "[power-hook] disabled: power_on_before_print=${POWER_ON_BEFORE_PRINT} entity=${POWER_SWITCH_ENTITY_ID:-<empty>}" >> "${POWER_LOG_FILE}"
   for backend in ${POWER_WRAPPED_BACKENDS}; do
     restore_backend "${backend}"
+    echo "[power-hook] wrapper restored for backend=${backend}" >> "${POWER_LOG_FILE}"
   done
 fi
 
@@ -161,7 +224,7 @@ DefaultShared Yes
   Allow 192.168.0.0/16
 </Location>
 
-<Limit Send-Document Send-URI Hold-Job Release-Job Restart-Job Purge-Jobs Set-Job-Attributes Create-Job-Subscription Renew-Subscription Cancel-Subscription Get-Notifications Reprocess-Job Cancel-Current-Job Suspend-Current-Job Resume-Job Cancel-My-Jobs Close-Job CUPS-Move-Job CUPS-Get-Document>
+<Limit Send-Document Send-URI Hold-Job Release-Job Restart-Job Purge-Jobs Set-Job-Attributes Create-Job-Subscription Renew-Subscription Cancel-Subscription Get-Notifications Reprocess-Job Cancel-Job Cancel-Current-Job Suspend-Current-Job Resume-Job Cancel-My-Jobs Close-Job CUPS-Move-Job CUPS-Get-Document>
   Order allow,deny
   Allow localhost
   Allow 10.0.0.0/8
@@ -178,6 +241,8 @@ JobSheets none,none
 PreserveJobHistory No
 EOL
 fi
+
+ensure_admin_permissions
 
 # Create a symlink from the default config location to our persistent location
 ln -sf /data/cups/config/cupsd.conf /etc/cups/cupsd.conf
