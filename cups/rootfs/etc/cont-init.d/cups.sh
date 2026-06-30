@@ -5,7 +5,7 @@ if [ -f /usr/lib/bashio/bashio.sh ]; then
   source /usr/lib/bashio/bashio.sh
 fi
 
-BACKEND_DIR="/usr/lib/cups/backend"
+BACKEND_DIR=""
 POWER_WRAPPED_BACKENDS="socket ipp ipps lpd usb dnssd"
 POWER_LOG_FILE="/data/cups/logs/power-wrapper.log"
 
@@ -60,7 +60,7 @@ install_power_wrapper() {
   local real="${BACKEND_DIR}/${backend}.real"
 
   if [ ! -e "${target}" ] && [ ! -e "${real}" ]; then
-    return 0
+    return 2
   fi
 
   if [ -e "${target}" ] && [ ! -e "${real}" ]; then
@@ -81,7 +81,7 @@ log_msg() {
   mkdir -p "\$(dirname "\${POWER_LOG_FILE}")" >/dev/null 2>&1 || true
   echo "\${now} [power-hook-wrapper] \${message}" >> "\${POWER_LOG_FILE}" 2>/dev/null || true
   if [ -w /proc/1/fd/1 ]; then
-    echo "\${now} [power-hook-wrapper] \${message}" > /proc/1/fd/1 2>/dev/null || true
+    echo "\${now} [power-hook-wrapper] \${message}" >> /proc/1/fd/1 2>/dev/null || true
   fi
 }
 
@@ -126,6 +126,7 @@ exec "\${BACKEND_REAL}" "\$@"
 EOF
 
   chmod 755 "${target}"
+  return 0
 }
 
 restore_backend() {
@@ -137,6 +138,92 @@ restore_backend() {
     rm -f "${target}"
     mv "${real}" "${target}"
   fi
+}
+
+detect_backend_dir() {
+  if [ -d /usr/lib/cups/backend ]; then
+    BACKEND_DIR="/usr/lib/cups/backend"
+  elif [ -d /usr/libexec/cups/backend ]; then
+    BACKEND_DIR="/usr/libexec/cups/backend"
+  else
+    BACKEND_DIR=""
+  fi
+}
+
+append_backend_schemes_from_queues() {
+  local queue_file="/data/cups/config/printers.conf"
+  local schemes
+
+  if [ ! -f "${queue_file}" ]; then
+    return 0
+  fi
+
+  schemes=$(sed -n 's/^[[:space:]]*DeviceURI[[:space:]]\+\([a-zA-Z0-9+.-]\+\):.*/\1/p' "${queue_file}" | tr 'A-Z' 'a-z' | sort -u)
+  if [ -n "${schemes}" ]; then
+    POWER_WRAPPED_BACKENDS="${POWER_WRAPPED_BACKENDS} ${schemes}"
+  fi
+}
+
+power_on_switch_api() {
+  local source="$1"
+  local token="${SUPERVISOR_TOKEN:-}"
+  local http_code
+
+  if [ -z "${POWER_SWITCH_ENTITY_ID}" ] || [ -z "${token}" ]; then
+    log_startup "${source}: skip switch.turn_on (missing entity_id or supervisor token)"
+    return 0
+  fi
+
+  http_code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 -X POST \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "{\"entity_id\":\"${POWER_SWITCH_ENTITY_ID}\"}" \
+    "http://supervisor/core/api/services/switch/turn_on" || echo "curl_failed")
+
+  log_startup "${source}: switch.turn_on result=http_${http_code} entity=${POWER_SWITCH_ENTITY_ID}"
+
+  if [[ "${POWER_ON_DELAY}" =~ ^[0-9]+$ ]] && [ "${POWER_ON_DELAY}" -gt 0 ]; then
+    log_startup "${source}: waiting ${POWER_ON_DELAY}s before continuing"
+    sleep "${POWER_ON_DELAY}"
+  fi
+}
+
+start_job_monitor() {
+  if [ "${POWER_ON_BEFORE_PRINT}" != "true" ] || [ -z "${POWER_SWITCH_ENTITY_ID}" ]; then
+    return 0
+  fi
+
+  if ! command -v lpstat >/dev/null 2>&1; then
+    log_startup "job-monitor: lpstat command not found; monitor disabled"
+    return 0
+  fi
+
+  (
+    last_jobs=""
+    tick=0
+    log_startup "job-monitor: loop active"
+
+    while true; do
+      current_jobs=$(lpstat -W not-completed -o 2>/dev/null | awk '{print $1}' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+
+      if [ -n "${current_jobs}" ] && [ "${current_jobs}" != "${last_jobs}" ]; then
+        log_startup "job-monitor: detected active jobs=${current_jobs}"
+        power_on_switch_api "job-monitor"
+        last_jobs="${current_jobs}"
+      elif [ -z "${current_jobs}" ]; then
+        last_jobs=""
+      fi
+
+      tick=$((tick + 1))
+      if [ $((tick % 30)) -eq 0 ]; then
+        log_startup "job-monitor: heartbeat current_jobs=${current_jobs:-<none>}"
+      fi
+
+      sleep 2
+    done
+  ) &
+
+  log_startup "job-monitor: started fallback watcher pid=$!"
 }
 
 ensure_admin_permissions() {
@@ -205,22 +292,41 @@ fi
 
 log_startup "resolved config: enabled=${POWER_ON_BEFORE_PRINT} entity=${POWER_SWITCH_ENTITY_ID:-<empty>} delay=${POWER_ON_DELAY}s"
 
-if [ "${POWER_ON_BEFORE_PRINT}" = "true" ] && [ -n "${POWER_SWITCH_ENTITY_ID}" ]; then
+detect_backend_dir
+if [ -z "${BACKEND_DIR}" ]; then
+  log_startup "no CUPS backend directory found; skipping wrapper installation"
+fi
+append_backend_schemes_from_queues
+log_startup "effective backend candidates: $(printf '%s\n' ${POWER_WRAPPED_BACKENDS} | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ')"
+
+if [ "${POWER_ON_BEFORE_PRINT}" = "true" ] && [ -n "${POWER_SWITCH_ENTITY_ID}" ] && [ -n "${BACKEND_DIR}" ]; then
   export HA_POWER_SWITCH_ENTITY_ID="${POWER_SWITCH_ENTITY_ID}"
   export HA_POWER_ON_DELAY="${POWER_ON_DELAY}"
 
-  log_startup "enabled: entity=${POWER_SWITCH_ENTITY_ID} delay=${POWER_ON_DELAY}s"
+  log_startup "enabled: entity=${POWER_SWITCH_ENTITY_ID} delay=${POWER_ON_DELAY}s backend_dir=${BACKEND_DIR}"
 
-  for backend in ${POWER_WRAPPED_BACKENDS}; do
+  for backend in $(printf '%s\n' ${POWER_WRAPPED_BACKENDS} | tr ' ' '\n' | awk 'NF' | sort -u); do
     install_power_wrapper "${backend}"
-    log_startup "wrapper installed for backend=${backend}"
+    case "$?" in
+      0)
+        log_startup "wrapper installed for backend=${backend}"
+        ;;
+      2)
+        log_startup "wrapper skipped for backend=${backend} (backend not present)"
+        ;;
+      *)
+        log_startup "wrapper install failed for backend=${backend}"
+        ;;
+    esac
   done
 else
   log_startup "disabled: power_on_before_print=${POWER_ON_BEFORE_PRINT} entity=${POWER_SWITCH_ENTITY_ID:-<empty>}"
-  for backend in ${POWER_WRAPPED_BACKENDS}; do
-    restore_backend "${backend}"
-    log_startup "wrapper restored for backend=${backend}"
-  done
+  if [ -n "${BACKEND_DIR}" ]; then
+    for backend in $(printf '%s\n' ${POWER_WRAPPED_BACKENDS} | tr ' ' '\n' | awk 'NF' | sort -u); do
+      restore_backend "${backend}"
+      log_startup "wrapper restored for backend=${backend}"
+    done
+  fi
 fi
 
 # Create CUPS configuration directory if it doesn't exist
@@ -299,6 +405,8 @@ EOL
 fi
 
 ensure_admin_permissions
+
+start_job_monitor
 
 # Create a symlink from the default config location to our persistent location
 ln -sf /data/cups/config/cupsd.conf /etc/cups/cupsd.conf
