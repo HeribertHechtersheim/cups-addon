@@ -1,5 +1,74 @@
 #!/usr/bin/with-contenv bash
 
+if [ -f /usr/lib/bashio/bashio.sh ]; then
+  # shellcheck source=/dev/null
+  source /usr/lib/bashio/bashio.sh
+fi
+
+BACKEND_DIR="/usr/lib/cups/backend"
+POWER_WRAPPED_BACKENDS="socket ipp ipps lpd usb dnssd"
+
+install_power_wrapper() {
+  local backend="$1"
+  local target="${BACKEND_DIR}/${backend}"
+  local real="${BACKEND_DIR}/${backend}.real"
+
+  if [ ! -e "${target}" ] && [ ! -e "${real}" ]; then
+    return 0
+  fi
+
+  if [ -e "${target}" ] && [ ! -e "${real}" ]; then
+    mv "${target}" "${real}"
+  fi
+
+  cat > "${target}" << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKEND_REAL="${real}"
+
+power_on_switch() {
+  local entity_id="\${HA_POWER_SWITCH_ENTITY_ID:-}"
+  local delay="\${HA_POWER_ON_DELAY:-0}"
+  local token="\${SUPERVISOR_TOKEN:-}"
+
+  if [ -z "\${entity_id}" ] || [ -z "\${token}" ]; then
+    return 0
+  fi
+
+  curl -sS --max-time 10 -X POST \
+    -H "Authorization: Bearer \${token}" \
+    -H "Content-Type: application/json" \
+    -d "{\"entity_id\":\"\${entity_id}\"}" \
+    "http://supervisor/core/api/services/switch/turn_on" >/dev/null || true
+
+  if [[ "\${delay}" =~ ^[0-9]+$ ]] && [ "\${delay}" -gt 0 ]; then
+    sleep "\${delay}"
+  fi
+}
+
+# Backends are called without job arguments for discovery.
+if [ "\$#" -ge 5 ]; then
+  power_on_switch
+fi
+
+exec "\${BACKEND_REAL}" "\$@"
+EOF
+
+  chmod 755 "${target}"
+}
+
+restore_backend() {
+  local backend="$1"
+  local target="${BACKEND_DIR}/${backend}"
+  local real="${BACKEND_DIR}/${backend}.real"
+
+  if [ -e "${real}" ]; then
+    rm -f "${target}"
+    mv "${real}" "${target}"
+  fi
+}
+
 # Create CUPS data directories for persistence
 mkdir -p /data/cups/cache
 mkdir -p /data/cups/logs
@@ -11,6 +80,29 @@ mkdir -p /data/cups/config/ssl
 # Set proper permissions
 chown -R root:lp /data/cups
 chmod -R 775 /data/cups
+
+POWER_ON_BEFORE_PRINT="false"
+POWER_SWITCH_ENTITY_ID=""
+POWER_ON_DELAY="0"
+
+if declare -F bashio::config >/dev/null 2>&1; then
+  POWER_ON_BEFORE_PRINT="$(bashio::config 'power_on_before_print')"
+  POWER_SWITCH_ENTITY_ID="$(bashio::config 'power_switch_entity_id')"
+  POWER_ON_DELAY="$(bashio::config 'power_on_delay')"
+fi
+
+if [ "${POWER_ON_BEFORE_PRINT}" = "true" ] && [ -n "${POWER_SWITCH_ENTITY_ID}" ]; then
+  export HA_POWER_SWITCH_ENTITY_ID="${POWER_SWITCH_ENTITY_ID}"
+  export HA_POWER_ON_DELAY="${POWER_ON_DELAY}"
+
+  for backend in ${POWER_WRAPPED_BACKENDS}; do
+    install_power_wrapper "${backend}"
+  done
+else
+  for backend in ${POWER_WRAPPED_BACKENDS}; do
+    restore_backend "${backend}"
+  done
+fi
 
 # Create CUPS configuration directory if it doesn't exist
 mkdir -p /etc/cups

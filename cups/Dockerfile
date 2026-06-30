@@ -19,6 +19,7 @@ RUN \
         cups-filters \
         avahi \
         dbus \
+        curl \
         ghostscript \
         libjpeg-turbo \
         net-snmp \
