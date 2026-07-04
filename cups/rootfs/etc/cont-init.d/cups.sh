@@ -188,7 +188,19 @@ log_msg "job=\${job_id} exec backend_real=\${BACKEND_REAL}"
 # which requires waiting on it as a child process rather than replacing
 # this process's image outright. TERM/INT are forwarded to the child so
 # job cancellation still stops the real backend as before.
-"\${BACKEND_REAL}" "\$@" &
+#
+# CRITICAL: "<&0" is required. In a non-interactive shell (no job
+# control, which is the case here), bash automatically redirects an
+# asynchronous ("&") command's stdin from /dev/null UNLESS there is an
+# explicit redirection - even though nothing else about backgrounding
+# would suggest that. CUPS backends read the actual print data from
+# stdin (when cupsd doesn't pass a filename as the 6th argument), so
+# without this the real backend silently received an EMPTY job: cupsd
+# would report the job as rendered/completed and it would vanish with
+# no error and no output, since the backend legitimately saw zero bytes.
+# This was invisible with the previous exec-based version since exec
+# truly replaces the process image, preserving the real stdin as-is.
+"\${BACKEND_REAL}" "\$@" <&0 &
 backend_pid=\$!
 trap 'kill -TERM "\${backend_pid}" 2>/dev/null || true' TERM INT
 wait "\${backend_pid}"
