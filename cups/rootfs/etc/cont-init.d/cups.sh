@@ -321,29 +321,20 @@ ensure_admin_permissions() {
   cat >> "${cupsd_conf}" << 'EOL'
 
 # HA_CUPS_ADMIN_RIGHTS
-# Allow LAN users to manage and cancel jobs from the web UI.
-# NOTE: <Limit> is only valid NESTED inside <Location>/<Policy>, never
-# standalone - a standalone <Limit> here was previously reported by
-# cupsd -t as "Unknown directive <Limit" (and every line inside it) on
-# every boot. Wrapped in <Location /> (matches all requests, consistent
-# with the rest of this file's LAN-only, no-auth access model) to fix.
-<Location />
-  <Limit Cancel-Job Cancel-My-Jobs Cancel-Current-Job Purge-Jobs CUPS-Move-Job>
-    Order allow,deny
-    Allow localhost
-    Allow 10.0.0.0/8
-    Allow 172.16.0.0/12
-    Allow 192.168.0.0/16
-  </Limit>
-
-  <Limit CUPS-Add-Modify-Printer CUPS-Delete-Printer CUPS-Add-Modify-Class CUPS-Delete-Class CUPS-Set-Default CUPS-Accept-Jobs CUPS-Reject-Jobs Pause-Printer Resume-Printer Enable-Printer Disable-Printer>
-    Order allow,deny
-    Allow localhost
-    Allow 10.0.0.0/8
-    Allow 172.16.0.0/12
-    Allow 192.168.0.0/16
-  </Limit>
-</Location>
+# Historically this appended IPP-operation <Limit> blocks (Cancel-Job,
+# CUPS-Add-Modify-Printer, etc.) here at/near the top level. That was
+# invalid on two counts: (1) <Limit> must be nested inside <Location> or
+# <Policy>, never standalone, and (2) IPP operation names are only valid
+# inside a <Policy>'s <Limit> - inside a <Location>'s <Limit> the
+# arguments must be HTTP methods (GET/POST/etc), so wrapping them in
+# <Location /> (tried previously) still produced "Unknown request type"
+# warnings, plus a "Duplicate <Location />" warning since the base
+# template already defines one. Since the base template's <Location />
+# already grants full LAN access to every request regardless of
+# operation, these blocks never added any actual restriction even when
+# "working" - removed as redundant rather than reimplemented via
+# <Policy>, to avoid the risk of an incorrectly-scoped policy
+# accidentally denying operations that currently work fine.
 EOL
 }
 
@@ -454,20 +445,17 @@ DefaultShared Yes
   Allow 192.168.0.0/16
 </Location>
 
-# NOTE: <Limit> is only valid NESTED inside <Location>/<Policy>, never
-# standalone - a standalone <Limit> here was previously reported by
-# cupsd -t as "Unknown directive <Limit" (and every line inside it) on
-# every boot. Wrapped in <Location /> (matches all requests, consistent
-# with the rest of this file's LAN-only, no-auth access model) to fix.
-<Location />
-  <Limit Send-Document Send-URI Hold-Job Release-Job Restart-Job Purge-Jobs Set-Job-Attributes Create-Job-Subscription Renew-Subscription Cancel-Subscription Get-Notifications Reprocess-Job Cancel-Job Cancel-Current-Job Suspend-Current-Job Resume-Job Cancel-My-Jobs Close-Job CUPS-Move-Job CUPS-Get-Document>
-    Order allow,deny
-    Allow localhost
-    Allow 10.0.0.0/8
-    Allow 172.16.0.0/12
-    Allow 192.168.0.0/16
-  </Limit>
-</Location>
+# NOTE: an IPP-operation <Limit> block (Send-Document, Cancel-Job, etc.)
+# used to be placed here. It never actually worked: <Limit> must be
+# nested inside <Location>/<Policy> (a standalone one is an "Unknown
+# directive"), and even nested inside <Location> the arguments must be
+# HTTP methods, not IPP operation names (nesting IPP operation names in
+# <Location> produces "Unknown request type" plus a "Duplicate <Location
+# />" warning, since one is already defined above). Since <Location />
+# above already grants full LAN access to every request/operation
+# regardless, this never added any actual restriction - removed as
+# redundant rather than reimplemented via <Policy>, to avoid the risk of
+# an incorrectly-scoped policy denying operations that work fine today.
 
 # Enable web interface
 WebInterface Yes
