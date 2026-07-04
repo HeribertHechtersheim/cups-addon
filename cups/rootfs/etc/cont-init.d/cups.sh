@@ -804,14 +804,22 @@ log_startup "cupsd config test exit_code=${cupsd_test_status}"
 # ]` guard above) and reused forever, accumulating patches from every add-on
 # version it has lived through (LogLevel migrations, HA_CUPS_ADMIN_RIGHTS/
 # HA_CUPS_LOG_PATHS marker blocks added and removed, etc). On some installs
-# this has drifted into a state with multiple genuinely unparseable lines
-# ("Unknown directive" at several different line numbers, discovered one at
-# a time as each was individually patched) - patching single known-bad lines
-# is whack-a-mole and cannot converge. If the config test reports errors,
-# discard the file entirely and regenerate it fresh from the current
-# template instead. This does NOT touch printers.conf/classes.conf/etc (a
-# separate file), so configured printers are preserved.
-if [ "${cupsd_test_status}" -ne 0 ] || printf '%s' "${cupsd_test_output}" | grep -qi "unknown directive"; then
+# this has drifted into a state with multiple genuinely unparseable lines,
+# discovered one at a time as each was individually patched (previously
+# "Unknown directive", then "Duplicate <Location />"/"Unknown request
+# type") - patching single known-bad lines/error substrings is whack-a-mole
+# and cannot converge, and narrowly matching one specific error string (as
+# an earlier version of this check did, matching only "unknown directive")
+# missed later error types entirely, silently skipping the self-heal it was
+# meant to trigger. So: treat ANY cupsd -t output line that isn't one of
+# the two expected "<file>" is OK. success confirmations as a sign the
+# config needs regenerating, regardless of the specific wording. If the
+# config test reports problems, discard the file entirely and regenerate
+# it fresh from the current template instead. This does NOT touch
+# printers.conf/classes.conf/etc (a separate file), so configured printers
+# are preserved.
+cupsd_test_problems="$(printf '%s\n' "${cupsd_test_output}" | grep -v '" is OK\.$' | grep -v '^[[:space:]]*$' || true)"
+if [ "${cupsd_test_status}" -ne 0 ] || [ -n "${cupsd_test_problems}" ]; then
   broken_backup="/data/cups/config/cupsd.conf.broken.$(date +%s 2>/dev/null || echo unknown)"
   log_startup "cupsd config test failed - regenerating cupsd.conf from template (backup: ${broken_backup})"
   cp /data/cups/config/cupsd.conf "${broken_backup}" 2>/dev/null || true
