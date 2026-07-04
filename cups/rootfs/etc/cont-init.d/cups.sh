@@ -322,21 +322,28 @@ ensure_admin_permissions() {
 
 # HA_CUPS_ADMIN_RIGHTS
 # Allow LAN users to manage and cancel jobs from the web UI.
-<Limit Cancel-Job Cancel-My-Jobs Cancel-Current-Job Purge-Jobs CUPS-Move-Job>
-  Order allow,deny
-  Allow localhost
-  Allow 10.0.0.0/8
-  Allow 172.16.0.0/12
-  Allow 192.168.0.0/16
-</Limit>
+# NOTE: <Limit> is only valid NESTED inside <Location>/<Policy>, never
+# standalone - a standalone <Limit> here was previously reported by
+# cupsd -t as "Unknown directive <Limit" (and every line inside it) on
+# every boot. Wrapped in <Location /> (matches all requests, consistent
+# with the rest of this file's LAN-only, no-auth access model) to fix.
+<Location />
+  <Limit Cancel-Job Cancel-My-Jobs Cancel-Current-Job Purge-Jobs CUPS-Move-Job>
+    Order allow,deny
+    Allow localhost
+    Allow 10.0.0.0/8
+    Allow 172.16.0.0/12
+    Allow 192.168.0.0/16
+  </Limit>
 
-<Limit CUPS-Add-Modify-Printer CUPS-Delete-Printer CUPS-Add-Modify-Class CUPS-Delete-Class CUPS-Set-Default CUPS-Accept-Jobs CUPS-Reject-Jobs Pause-Printer Resume-Printer Enable-Printer Disable-Printer>
-  Order allow,deny
-  Allow localhost
-  Allow 10.0.0.0/8
-  Allow 172.16.0.0/12
-  Allow 192.168.0.0/16
-</Limit>
+  <Limit CUPS-Add-Modify-Printer CUPS-Delete-Printer CUPS-Add-Modify-Class CUPS-Delete-Class CUPS-Set-Default CUPS-Accept-Jobs CUPS-Reject-Jobs Pause-Printer Resume-Printer Enable-Printer Disable-Printer>
+    Order allow,deny
+    Allow localhost
+    Allow 10.0.0.0/8
+    Allow 172.16.0.0/12
+    Allow 192.168.0.0/16
+  </Limit>
+</Location>
 EOL
 }
 
@@ -447,13 +454,20 @@ DefaultShared Yes
   Allow 192.168.0.0/16
 </Location>
 
-<Limit Send-Document Send-URI Hold-Job Release-Job Restart-Job Purge-Jobs Set-Job-Attributes Create-Job-Subscription Renew-Subscription Cancel-Subscription Get-Notifications Reprocess-Job Cancel-Job Cancel-Current-Job Suspend-Current-Job Resume-Job Cancel-My-Jobs Close-Job CUPS-Move-Job CUPS-Get-Document>
-  Order allow,deny
-  Allow localhost
-  Allow 10.0.0.0/8
-  Allow 172.16.0.0/12
-  Allow 192.168.0.0/16
-</Limit>
+# NOTE: <Limit> is only valid NESTED inside <Location>/<Policy>, never
+# standalone - a standalone <Limit> here was previously reported by
+# cupsd -t as "Unknown directive <Limit" (and every line inside it) on
+# every boot. Wrapped in <Location /> (matches all requests, consistent
+# with the rest of this file's LAN-only, no-auth access model) to fix.
+<Location />
+  <Limit Send-Document Send-URI Hold-Job Release-Job Restart-Job Purge-Jobs Set-Job-Attributes Create-Job-Subscription Renew-Subscription Cancel-Subscription Get-Notifications Reprocess-Job Cancel-Job Cancel-Current-Job Suspend-Current-Job Resume-Job Cancel-My-Jobs Close-Job CUPS-Move-Job CUPS-Get-Document>
+    Order allow,deny
+    Allow localhost
+    Allow 10.0.0.0/8
+    Allow 172.16.0.0/12
+    Allow 192.168.0.0/16
+  </Limit>
+</Location>
 
 # Enable web interface
 WebInterface Yes
