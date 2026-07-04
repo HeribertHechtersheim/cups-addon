@@ -166,7 +166,7 @@ power_on_switch() {
   # tells us EXACTLY which check failed -- a status code alone leaves
   # multiple possible causes ambiguous.
   local self_check_raw self_check_body self_check_code
-  self_check_raw=$(curl -sS --max-time 10 -w "HTTP_CODE:%{http_code}" \
+  self_check_raw=\$(curl -sS --max-time 10 -w "HTTP_CODE:%{http_code}" \
     -H "Authorization: Bearer \${token}" \
     "http://supervisor/addons/self/info" 2>&1 || echo "curl_failed")
   self_check_code="\${self_check_raw##*HTTP_CODE:}"
@@ -174,7 +174,7 @@ power_on_switch() {
   log_msg "job=\${job_id} same-moment self-check result=http_\${self_check_code} body=\${self_check_body:0:200}"
 
   local http_raw http_body http_code
-  http_raw=$(curl -sS --max-time 10 -w "HTTP_CODE:%{http_code}" -X POST \
+  http_raw=\$(curl -sS --max-time 10 -w "HTTP_CODE:%{http_code}" -X POST \
     -H "Authorization: Bearer \${token}" \
     -H "Content-Type: application/json" \
     -d "{\"entity_id\":\"\${entity_id}\"}" \
