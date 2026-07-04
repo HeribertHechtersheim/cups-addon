@@ -17,7 +17,7 @@ This Home Assistant add-on provides a CUPS (Common Unix Printing System) print s
 - **Printer Support**: Compatible with a wide range of network and USB printers
 - **Lightweight**: Built on Alpine Linux for minimal resource usage
 - **Data Persistence**: Printer settings and configurations persist across restarts and updates
-- **Smart Plug Pre-Power**: Optionally turn on a Home Assistant switch before each print job
+- **Print Job Automation Hooks**: Optionally trigger Home Assistant automations when a print job starts and/or finishes (e.g. to power on a smart plug before printing and power it off afterward)
 
 ## Installation
 
@@ -57,18 +57,20 @@ The add-on provides the following configuration options:
 ```yaml
 admin_username: printadmin
 admin_password: your_secure_password
-power_on_before_print: false
-power_switch_entity_id: switch.printer_plug
-power_on_delay: 5
+enable_print_automations: false
+job_start_automation_entity_id: automation.printer_power_on
+job_finished_automation_entity_id: automation.printer_power_off
+job_start_delay: 5
 ```
 
 - **admin_username**: Username for the CUPS admin interface (default: printadmin)
 - **admin_password**: Password for the CUPS admin interface
-- **power_on_before_print**: If true, the add-on calls Home Assistant to turn on a switch before each print job
-- **power_switch_entity_id**: Home Assistant switch entity ID to turn on (example: `switch.printer_plug`)
-- **power_on_delay**: Optional wait time in seconds after power-on and before forwarding the print job (0-60)
+- **enable_print_automations**: If true, the add-on triggers Home Assistant automations when a print job starts and/or finishes
+- **job_start_automation_entity_id**: Home Assistant automation entity ID to trigger when a print job starts (example: `automation.printer_power_on`)
+- **job_finished_automation_entity_id**: Home Assistant automation entity ID to trigger when a print job finishes (example: `automation.printer_power_off`)
+- **job_start_delay**: Optional wait time in seconds after triggering the start automation and before forwarding the print job (0-60), giving the automation time to e.g. power on the printer
 
-When enabled, this works automatically for common CUPS backends (socket/IPP/IPPS/LPD/USB) and does not require changing your printer queue settings.
+Each entity ID is optional independently - set only `job_start_automation_entity_id` if you don't need a finish hook, for example. When enabled, this works automatically for common CUPS backends (socket/IPP/IPPS/LPD/USB) and does not require changing your printer queue settings.
 
 After configuring:
 

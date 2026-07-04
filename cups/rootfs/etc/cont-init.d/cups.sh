@@ -92,14 +92,44 @@ log_msg() {
   fi
 }
 
-power_on_switch() {
-  # NOTE: entity_id/delay/token are deliberately NOT read from environment
-  # variables here. cupsd runs backends with a security-sanitized
-  # environment and does not pass through arbitrary variables set by
-  # cont-init.d scripts (confirmed: even SUPERVISOR_TOKEN, a real
-  # container-level env var, was empty inside this wrapper). Instead, read
-  # the values directly from files written by cont-init.d at startup.
-  local entity_id=""
+trigger_automation() {
+  # Generic helper shared by both the job-start and job-finished hooks
+  # below: POSTs to Home Assistant's automation.trigger service via
+  # Supervisor's core API proxy for whichever automation entity_id is
+  # passed in. Captures the response BODY (not just status code) in the
+  # same request via a trailing "HTTP_CODE:NNN" marker split back out
+  # below, so any rejection's actual message is directly visible in the
+  # log instead of just a bare status code.
+  local job_id="\$1"
+  local hook_name="\$2"
+  local automation_entity_id="\$3"
+  local token="\$4"
+
+  if [ -z "\${automation_entity_id}" ] || [ -z "\${token}" ]; then
+    log_msg "job=\${job_id} skip \${hook_name} automation trigger (missing entity_id or supervisor token)"
+    return 0
+  fi
+
+  local trigger_raw trigger_body trigger_code
+  trigger_raw=\$(curl -sS --max-time 10 -w "HTTP_CODE:%{http_code}" -X POST \
+    -H "Authorization: Bearer \${token}" \
+    -H "Content-Type: application/json" \
+    -d "{\"entity_id\":\"\${automation_entity_id}\"}" \
+    "http://supervisor/core/api/services/automation/trigger" 2>&1 || echo "curl_failed")
+  trigger_code="\${trigger_raw##*HTTP_CODE:}"
+  trigger_body="\${trigger_raw%HTTP_CODE:*}"
+  log_msg "job=\${job_id} \${hook_name} automation.trigger entity=\${automation_entity_id} result=http_\${trigger_code} body=\${trigger_body:0:200}"
+}
+
+job_start_hook() {
+  # NOTE: automation entity IDs/delay/token are deliberately NOT read from
+  # environment variables here. cupsd runs backends with a
+  # security-sanitized environment and does not pass through arbitrary
+  # variables set by cont-init.d scripts (confirmed: even SUPERVISOR_TOKEN,
+  # a real container-level env var, was empty inside this wrapper).
+  # Instead, read the values directly from files written by cont-init.d at
+  # startup.
+  local start_automation_id=""
   local delay="0"
   local token=""
   local job_id="\${1:-unknown}"
@@ -107,81 +137,16 @@ power_on_switch() {
   if [ -f "\${POWER_STATE_FILE}" ]; then
     # shellcheck disable=SC1090
     source "\${POWER_STATE_FILE}"
-    entity_id="\${HA_POWER_SWITCH_ENTITY_ID:-}"
-    delay="\${HA_POWER_ON_DELAY:-0}"
+    start_automation_id="\${HA_JOB_START_AUTOMATION_ID:-}"
+    delay="\${HA_JOB_START_DELAY:-0}"
   fi
   if [ -f "\${POWER_TOKEN_FILE}" ]; then
     token="\$(cat "\${POWER_TOKEN_FILE}" 2>/dev/null || true)"
   fi
 
-  log_msg "job=\${job_id} power_on_switch invoked entity=\${entity_id:-<empty>} delay=\${delay} token_present=\$([ -n "\${token}" ] && echo yes || echo no)"
-  # DIAGNOSTIC: same non-secret-leaking fingerprint format as the boot-time
-  # self-check, so the two can be diff'd directly to prove/disprove whether
-  # the token read from POWER_TOKEN_FILE at print time still matches the
-  # token Supervisor saw as SUPERVISOR_TOKEN at container boot.
-  if [ -n "\${token}" ]; then
-    log_msg "job=\${job_id} runtime token fingerprint: len=\${#token}:\${token:0:6}...\${token: -6}"
-  fi
-  # DIAGNOSTIC: pull the boot-time fingerprint from STARTUP_LOG_FILE (rather
-  # than relying on it still being visible in the live/rotating container
-  # log, which verbose cupsd debug output can push out) so both fingerprints
-  # land together in the reliably-tailed power-wrapper log for direct diff.
-  local boot_fp=""
-  if [ -f "\${STARTUP_LOG_FILE}" ]; then
-    boot_fp="\$(grep -o 'boot token fingerprint:.*' "\${STARTUP_LOG_FILE}" 2>/dev/null | tail -n1 || true)"
-    log_msg "job=\${job_id} \${boot_fp:-boot token fingerprint: <not found in startup.log>}"
-  fi
-  # DIAGNOSTIC: read the CURRENT boot counter (a persistent /data file,
-  # incremented by cont-init.d on every container start) at the moment of
-  # this print job. If this number is HIGHER than the boot count recorded
-  # in startup.log at the time this wrapper's token was captured, the
-  # container has restarted AGAIN since then -- proving Supervisor has
-  # already rotated to a newer token while this print job was in flight.
-  if [ -f "\${BOOT_COUNT_FILE}" ]; then
-    current_boot_count="\$(grep -o '^BOOT_COUNT=.*' "\${BOOT_COUNT_FILE}" 2>/dev/null || true)"
-    startup_boot_count="\$(grep -o 'boot count=[0-9]*' "\${STARTUP_LOG_FILE}" 2>/dev/null | tail -n1 || true)"
-    log_msg "job=\${job_id} current \${current_boot_count:-<unknown>} vs at-startup \${startup_boot_count:-<unknown>}"
-  fi
+  log_msg "job=\${job_id} job_start_hook invoked automation=\${start_automation_id:-<empty>} delay=\${delay} token_present=\$([ -n "\${token}" ] && echo yes || echo no)"
 
-  if [ -z "\${entity_id}" ] || [ -z "\${token}" ]; then
-    log_msg "job=\${job_id} skip power_on_switch due to missing entity_id or supervisor token"
-    return 0
-  fi
-
-  # DIAGNOSTIC: call an endpoint that goes through Supervisor's FULL
-  # token_validation middleware (same from_token()+access_homeassistant_api
-  # check as switch.turn_on's _check_access(), just via a different code
-  # path) at the exact same moment, with the exact same token, right before
-  # the actual switch.turn_on call. If this ALSO returns 401 here, the token
-  # itself is genuinely invalid/revoked at print time (not just a boot vs.
-  # print-time file mismatch, which we already ruled out). If this succeeds
-  # while switch.turn_on still fails, the problem is specific to that
-  # endpoint/request, not the token or permissions.
-  # DIAGNOSTIC: also capture the response BODY (truncated), not just the
-  # status code, in the SAME curl call (a trailing "HTTP_CODE:NNN" marker is
-  # appended to the body via -w and split back out below) so this stays a
-  # single same-moment request rather than two separate ones. Supervisor's
-  # rejection responses carry a "message" field (e.g. "Invalid password" /
-  # "Unknown Home Assistant API access!" / "Not permitted API access") that
-  # tells us EXACTLY which check failed -- a status code alone leaves
-  # multiple possible causes ambiguous.
-  local self_check_raw self_check_body self_check_code
-  self_check_raw=\$(curl -sS --max-time 10 -w "HTTP_CODE:%{http_code}" \
-    -H "Authorization: Bearer \${token}" \
-    "http://supervisor/addons/self/info" 2>&1 || echo "curl_failed")
-  self_check_code="\${self_check_raw##*HTTP_CODE:}"
-  self_check_body="\${self_check_raw%HTTP_CODE:*}"
-  log_msg "job=\${job_id} same-moment self-check result=http_\${self_check_code} body=\${self_check_body:0:200}"
-
-  local http_raw http_body http_code
-  http_raw=\$(curl -sS --max-time 10 -w "HTTP_CODE:%{http_code}" -X POST \
-    -H "Authorization: Bearer \${token}" \
-    -H "Content-Type: application/json" \
-    -d "{\"entity_id\":\"\${entity_id}\"}" \
-    "http://supervisor/core/api/services/switch/turn_on" 2>&1 || echo "curl_failed")
-  http_code="\${http_raw##*HTTP_CODE:}"
-  http_body="\${http_raw%HTTP_CODE:*}"
-  log_msg "job=\${job_id} switch.turn_on result=http_\${http_code} body=\${http_body:0:200}"
+  trigger_automation "\${job_id}" "job-start" "\${start_automation_id}" "\${token}"
 
   if [[ "\${delay}" =~ ^[0-9]+$ ]] && [ "\${delay}" -gt 0 ]; then
     log_msg "job=\${job_id} sleeping \${delay}s before forwarding job"
@@ -189,16 +154,53 @@ power_on_switch() {
   fi
 }
 
+job_finished_hook() {
+  local finish_automation_id=""
+  local token=""
+  local job_id="\${1:-unknown}"
+
+  if [ -f "\${POWER_STATE_FILE}" ]; then
+    # shellcheck disable=SC1090
+    source "\${POWER_STATE_FILE}"
+    finish_automation_id="\${HA_JOB_FINISHED_AUTOMATION_ID:-}"
+  fi
+  if [ -f "\${POWER_TOKEN_FILE}" ]; then
+    token="\$(cat "\${POWER_TOKEN_FILE}" 2>/dev/null || true)"
+  fi
+
+  trigger_automation "\${job_id}" "job-finished" "\${finish_automation_id}" "\${token}"
+}
+
+job_id="unknown"
 # Backends are called without job arguments for discovery.
 if [ "\$#" -ge 5 ]; then
-  log_msg "backend_call mode=job args=\$# job_id=\${1:-unknown} user=\${2:-unknown} title=\${3:-unknown} copies=\${4:-unknown}"
-  power_on_switch "\${1:-unknown}"
+  job_id="\${1:-unknown}"
+  log_msg "backend_call mode=job args=\$# job_id=\${job_id} user=\${2:-unknown} title=\${3:-unknown} copies=\${4:-unknown}"
+  job_start_hook "\${job_id}"
 else
   log_msg "backend_call mode=discovery args=\$#"
 fi
 
-log_msg "exec backend_real=\${BACKEND_REAL}"
-exec "\${BACKEND_REAL}" "\$@"
+log_msg "job=\${job_id} exec backend_real=\${BACKEND_REAL}"
+
+# NOTE: intentionally NOT using exec here (earlier versions did) - the
+# job-finished hook below needs to run AFTER the real backend completes,
+# which requires waiting on it as a child process rather than replacing
+# this process's image outright. TERM/INT are forwarded to the child so
+# job cancellation still stops the real backend as before.
+"\${BACKEND_REAL}" "\$@" &
+backend_pid=\$!
+trap 'kill -TERM "\${backend_pid}" 2>/dev/null || true' TERM INT
+wait "\${backend_pid}"
+backend_exit_code=\$?
+
+log_msg "job=\${job_id} backend_real exit_code=\${backend_exit_code}"
+
+if [ "\$#" -ge 5 ]; then
+  job_finished_hook "\${job_id}"
+fi
+
+exit "\${backend_exit_code}"
 EOF
 
   chmod 755 "${target}"
@@ -240,32 +242,34 @@ append_backend_schemes_from_queues() {
   fi
 }
 
-power_on_switch_api() {
+trigger_start_automation_api() {
   local source="$1"
   local token="${SUPERVISOR_TOKEN:-}"
-  local http_code
+  local trigger_raw trigger_body trigger_code
 
-  if [ -z "${POWER_SWITCH_ENTITY_ID}" ] || [ -z "${token}" ]; then
-    log_startup "${source}: skip switch.turn_on (missing entity_id or supervisor token)"
+  if [ -z "${JOB_START_AUTOMATION_ENTITY_ID}" ] || [ -z "${token}" ]; then
+    log_startup "${source}: skip automation.trigger (missing entity_id or supervisor token)"
     return 0
   fi
 
-  http_code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 -X POST \
+  trigger_raw=$(curl -sS --max-time 10 -w "HTTP_CODE:%{http_code}" -X POST \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
-    -d "{\"entity_id\":\"${POWER_SWITCH_ENTITY_ID}\"}" \
-    "http://supervisor/core/api/services/switch/turn_on" || echo "curl_failed")
+    -d "{\"entity_id\":\"${JOB_START_AUTOMATION_ENTITY_ID}\"}" \
+    "http://supervisor/core/api/services/automation/trigger" 2>&1 || echo "curl_failed")
+  trigger_code="${trigger_raw##*HTTP_CODE:}"
+  trigger_body="${trigger_raw%HTTP_CODE:*}"
 
-  log_startup "${source}: switch.turn_on result=http_${http_code} entity=${POWER_SWITCH_ENTITY_ID}"
+  log_startup "${source}: automation.trigger result=http_${trigger_code} entity=${JOB_START_AUTOMATION_ENTITY_ID} body=${trigger_body:0:200}"
 
-  if [[ "${POWER_ON_DELAY}" =~ ^[0-9]+$ ]] && [ "${POWER_ON_DELAY}" -gt 0 ]; then
-    log_startup "${source}: waiting ${POWER_ON_DELAY}s before continuing"
-    sleep "${POWER_ON_DELAY}"
+  if [[ "${JOB_START_DELAY}" =~ ^[0-9]+$ ]] && [ "${JOB_START_DELAY}" -gt 0 ]; then
+    log_startup "${source}: waiting ${JOB_START_DELAY}s before continuing"
+    sleep "${JOB_START_DELAY}"
   fi
 }
 
 start_job_monitor() {
-  if [ "${POWER_ON_BEFORE_PRINT}" != "true" ] || [ -z "${POWER_SWITCH_ENTITY_ID}" ]; then
+  if [ "${ENABLE_PRINT_AUTOMATIONS}" != "true" ] || [ -z "${JOB_START_AUTOMATION_ENTITY_ID}" ]; then
     return 0
   fi
 
@@ -279,7 +283,7 @@ start_job_monitor() {
 
       if [ -n "${spool_sig}" ] && [ "${spool_sig}" != "${last_spool_sig}" ]; then
         log_startup "job-monitor: detected spool activity files=${spool_sig}"
-        power_on_switch_api "job-monitor-spool"
+        trigger_start_automation_api "job-monitor-spool"
         last_spool_sig="${spool_sig}"
       fi
 
@@ -655,23 +659,26 @@ fi
 } > "${BOOT_COUNT_FILE}"
 log_startup "boot count=${new_boot_count} seconds_since_previous_boot=${seconds_since_prev}"
 
-POWER_ON_BEFORE_PRINT="false"
-POWER_SWITCH_ENTITY_ID=""
-POWER_ON_DELAY="0"
+ENABLE_PRINT_AUTOMATIONS="false"
+JOB_START_AUTOMATION_ENTITY_ID=""
+JOB_FINISHED_AUTOMATION_ENTITY_ID=""
+JOB_START_DELAY="0"
 
 if declare -F bashio::config >/dev/null 2>&1; then
   log_startup "loading options via bashio"
-  POWER_ON_BEFORE_PRINT="$(bashio::config 'power_on_before_print')"
-  POWER_SWITCH_ENTITY_ID="$(bashio::config 'power_switch_entity_id')"
-  POWER_ON_DELAY="$(bashio::config 'power_on_delay')"
+  ENABLE_PRINT_AUTOMATIONS="$(bashio::config 'enable_print_automations')"
+  JOB_START_AUTOMATION_ENTITY_ID="$(bashio::config 'job_start_automation_entity_id')"
+  JOB_FINISHED_AUTOMATION_ENTITY_ID="$(bashio::config 'job_finished_automation_entity_id')"
+  JOB_START_DELAY="$(bashio::config 'job_start_delay')"
 else
   log_startup "bashio not found, loading options via /data/options.json"
-  POWER_ON_BEFORE_PRINT="$(read_option_bool 'power_on_before_print' 'false')"
-  POWER_SWITCH_ENTITY_ID="$(read_option_str 'power_switch_entity_id' '')"
-  POWER_ON_DELAY="$(read_option_int 'power_on_delay' '0')"
+  ENABLE_PRINT_AUTOMATIONS="$(read_option_bool 'enable_print_automations' 'false')"
+  JOB_START_AUTOMATION_ENTITY_ID="$(read_option_str 'job_start_automation_entity_id' '')"
+  JOB_FINISHED_AUTOMATION_ENTITY_ID="$(read_option_str 'job_finished_automation_entity_id' '')"
+  JOB_START_DELAY="$(read_option_int 'job_start_delay' '0')"
 fi
 
-log_startup "resolved config: enabled=${POWER_ON_BEFORE_PRINT} entity=${POWER_SWITCH_ENTITY_ID:-<empty>} delay=${POWER_ON_DELAY}s"
+log_startup "resolved config: enabled=${ENABLE_PRINT_AUTOMATIONS} start_automation=${JOB_START_AUTOMATION_ENTITY_ID:-<empty>} finish_automation=${JOB_FINISHED_AUTOMATION_ENTITY_ID:-<empty>} delay=${JOB_START_DELAY}s"
 
 detect_backend_dir
 if [ -z "${BACKEND_DIR}" ]; then
@@ -680,15 +687,16 @@ fi
 append_backend_schemes_from_queues
 log_startup "effective backend candidates: $(printf '%s\n' ${POWER_WRAPPED_BACKENDS} | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ')"
 
-if [ "${POWER_ON_BEFORE_PRINT}" = "true" ] && [ -n "${POWER_SWITCH_ENTITY_ID}" ] && [ -n "${BACKEND_DIR}" ]; then
+if [ "${ENABLE_PRINT_AUTOMATIONS}" = "true" ] && ([ -n "${JOB_START_AUTOMATION_ENTITY_ID}" ] || [ -n "${JOB_FINISHED_AUTOMATION_ENTITY_ID}" ]) && [ -n "${BACKEND_DIR}" ]; then
   # NOTE: exporting these as env vars does NOT work - cupsd runs backends
   # with a security-sanitized environment and strips custom variables
   # before exec'ing them (confirmed: even SUPERVISOR_TOKEN, a genuine
   # container-level env var, never reached the wrapper). Persist them to
   # files instead; the wrapper reads these directly at invocation time.
   cat > "${POWER_STATE_FILE}" << EOF
-HA_POWER_SWITCH_ENTITY_ID="${POWER_SWITCH_ENTITY_ID}"
-HA_POWER_ON_DELAY="${POWER_ON_DELAY}"
+HA_JOB_START_AUTOMATION_ID="${JOB_START_AUTOMATION_ENTITY_ID}"
+HA_JOB_FINISHED_AUTOMATION_ID="${JOB_FINISHED_AUTOMATION_ENTITY_ID}"
+HA_JOB_START_DELAY="${JOB_START_DELAY}"
 EOF
   chown root:lp "${POWER_STATE_FILE}"
   chmod 640 "${POWER_STATE_FILE}"
@@ -697,7 +705,7 @@ EOF
   chown root:lp "${POWER_TOKEN_FILE}"
   chmod 640 "${POWER_TOKEN_FILE}"
 
-  log_startup "enabled: entity=${POWER_SWITCH_ENTITY_ID} delay=${POWER_ON_DELAY}s backend_dir=${BACKEND_DIR} token_present=$([ -n "${SUPERVISOR_TOKEN:-}" ] && echo yes || echo no)"
+  log_startup "enabled: start_automation=${JOB_START_AUTOMATION_ENTITY_ID:-<empty>} finish_automation=${JOB_FINISHED_AUTOMATION_ENTITY_ID:-<empty>} delay=${JOB_START_DELAY}s backend_dir=${BACKEND_DIR} token_present=$([ -n "${SUPERVISOR_TOKEN:-}" ] && echo yes || echo no)"
 
   # DIAGNOSTIC: ask Supervisor (self API, gated by hassio_api: true, which is
   # already granted) whether IT currently believes this add-on has
@@ -731,7 +739,7 @@ EOF
     esac
   done
 else
-  log_startup "disabled: power_on_before_print=${POWER_ON_BEFORE_PRINT} entity=${POWER_SWITCH_ENTITY_ID:-<empty>}"
+  log_startup "disabled: enable_print_automations=${ENABLE_PRINT_AUTOMATIONS} start_automation=${JOB_START_AUTOMATION_ENTITY_ID:-<empty>} finish_automation=${JOB_FINISHED_AUTOMATION_ENTITY_ID:-<empty>}"
   rm -f "${POWER_STATE_FILE}" "${POWER_TOKEN_FILE}"
   if [ -n "${BACKEND_DIR}" ]; then
     for backend in $(printf '%s\n' ${POWER_WRAPPED_BACKENDS} | tr ' ' '\n' | awk 'NF' | sort -u); do
